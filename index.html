@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BTK Domain Block Checker</title>
+
+<style>
+body {
+    font-family: Arial, sans-serif;
+    max-width: 1000px;
+    margin: 30px auto;
+    padding: 20px;
+}
+
+h2 {
+    margin-bottom: 15px;
+}
+
+textarea,
+input {
+    width: 100%;
+    padding: 10px;
+    box-sizing: border-box;
+    font-size: 14px;
+}
+
+textarea {
+    height: 220px;
+}
+
+label {
+    display: block;
+    margin-top: 12px;
+    margin-bottom: 5px;
+    font-weight: bold;
+}
+
+button {
+    margin-top: 10px;
+    padding: 10px 20px;
+    cursor: pointer;
+    font-size: 14px;
+}
+
+button:disabled {
+    cursor: wait;
+    opacity: 0.65;
+}
+
+.stats {
+    margin-top: 15px;
+    font-weight: bold;
+}
+
+table {
+    width: 100%;
+    margin-top: 20px;
+    border-collapse: collapse;
+}
+
+th,
+td {
+    border: 1px solid #ddd;
+    padding: 8px;
+    text-align: left;
+}
+
+th {
+    background: #f4f4f4;
+}
+
+.blocked {
+    color: red;
+    font-weight: bold;
+}
+
+.not-blocked {
+    color: green;
+    font-weight: bold;
+}
+
+.error {
+    color: orange;
+    font-weight: bold;
+}
+</style>
+</head>
+
+<body>
+
+<h2>BTK Domain Block Checker</h2>
+
+<label for="domains">Domains or URLs</label>
+<textarea id="domains" placeholder="Enter one domain per line
+
+https://www.example.com/path
+https://example.com
+https://sub.domain.com"></textarea>
+
+<br>
+
+<button id="checkButton" onclick="checkDomains()">Check Domains</button>
+
+<div class="stats" id="stats"></div>
+
+<table>
+    <thead>
+        <tr>
+            <th>Input</th>
+            <th>Domain Checked</th>
+            <th>Status</th>
+        </tr>
+    </thead>
+    <tbody id="results"></tbody>
+</table>
+
+<script>
+const API_BASE = "http://31.210.43.134";
+const TOKEN = "147ab-258cd-369ef";
+const MAX_CONCURRENT = 10;
+const REQUEST_TIMEOUT_MS = 25000;
+const HEALTH_TIMEOUT_MS = 7000;
+const COMPOUND_PUBLIC_SUFFIXES = new Set([
+    "av.tr",
+    "bel.tr",
+    "biz.tr",
+    "bbs.tr",
+    "com.tr",
+    "dr.tr",
+    "edu.tr",
+    "gen.tr",
+    "gov.tr",
+    "info.tr",
+    "k12.tr",
+    "kep.tr",
+    "mil.tr",
+    "name.tr",
+    "net.tr",
+    "org.tr",
+    "pol.tr",
+    "tel.tr",
+    "tsk.tr",
+    "tv.tr",
+    "web.tr"
+]);
+
+function getSettings() {
+    return {
+        apiBase: API_BASE.replace(/\/+$/, ""),
+        token: TOKEN
+    };
+}
+
+function fetchWithTimeout(url, options, timeoutMs) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    return fetch(url, {
+        ...options,
+        signal: controller.signal
+    }).finally(() => clearTimeout(timeoutId));
+}
+
+function stripSubdomains(host) {
+    const labels = host.split(".").filter(Boolean);
+    if (labels.length <= 2) {
+        return host;
+    }
+
+    const suffix = labels.slice(-2).join(".");
+    if (COMPOUND_PUBLIC_SUFFIXES.has(suffix) && labels.length >= 3) {
+        return labels.slice(-3).join(".");
+    }
+
+    return labels.slice(-2).join(".");
+}
+
+function normalizeDomainForDisplay(value) {
+    let text = value.trim();
+    if (!text) {
+        return "";
+    }
+
+    if (!text.includes("://")) {
+        text = `http://${text}`;
+    }
+
+    try {
+        const url = new URL(text);
+        let host = url.hostname.trim().replace(/\.+$/, "").toLowerCase();
+
+        if (host.startsWith("www.")) {
+            host = host.slice(4);
+        }
+
+        return stripSubdomains(host);
+    } catch (error) {
+        return "";
+    }
+}
+
+async function checkHealth(apiBase, token) {
+    if (!apiBase.startsWith("http://") && !apiBase.startsWith("https://")) {
+        throw new Error("API URL must start with http:// or https://");
+    }
+
+    if (!token) {
+        throw new Error("Auth token is required.");
+    }
+
+    let response;
+    try {
+        response = await fetchWithTimeout(
+            `${apiBase}/health`,
+            {
+                method: "GET",
+                mode: "cors",
+                cache: "no-store",
+                headers: {
+                    "X-Auth-Token": token
+                }
+            },
+            HEALTH_TIMEOUT_MS
+        );
+    } catch (error) {
+        throw new Error("Server offline, office network blocked it, or CORS is not enabled.");
+    }
+
+    if (response.status === 401) {
+        throw new Error("Invalid token. Check X-Auth-Token.");
+    }
+
+    if (!response.ok) {
+        throw new Error(`Health check failed: HTTP ${response.status}`);
+    }
+
+    const text = (await response.text()).trim();
+    if (text !== "OK") {
+        throw new Error(`Unexpected health response: ${text}`);
+    }
+}
+
+async function checkDomain(apiBase, token, domain) {
+    const url = `${apiBase}/check?domain=${encodeURIComponent(domain)}`;
+
+    let response;
+    try {
+        response = await fetchWithTimeout(
+            url,
+            {
+                method: "GET",
+                mode: "cors",
+                cache: "no-store",
+                headers: {
+                    "X-Auth-Token": token
+                }
+            },
+            REQUEST_TIMEOUT_MS
+        );
+    } catch (error) {
+        if (error.name === "AbortError") {
+            throw new Error("TIMEOUT");
+        }
+        throw new Error("NETWORK/CORS ERROR");
+    }
+
+    if (response.status === 401) {
+        throw new Error("INVALID TOKEN");
+    }
+
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+    }
+
+    return (await response.text()).trim();
+}
+
+function setStats(total, blockedCount, notBlockedCount, errorCount, finished) {
+    const statsDiv = document.getElementById("stats");
+    const prefix = finished ? "Finished | " : "";
+    statsDiv.textContent =
+        `${prefix}Total: ${total} | ` +
+        `Blocked: ${blockedCount} | ` +
+        `Not Blocked: ${notBlockedCount} | ` +
+        `Errors: ${errorCount}`;
+}
+
+function classifyResult(result) {
+    const resultLower = result.toLowerCase();
+
+    if (resultLower.includes("not blocked")) {
+        return "not-blocked";
+    }
+
+    if (resultLower.includes("blocked")) {
+        return "blocked";
+    }
+
+    return "error";
+}
+
+async function checkDomains() {
+    const textarea = document.getElementById("domains");
+    const resultsBody = document.getElementById("results");
+    const statsDiv = document.getElementById("stats");
+    const checkButton = document.getElementById("checkButton");
+    const { apiBase, token } = getSettings();
+
+    const domains = textarea.value
+        .split(/\r?\n/)
+        .map((x) => x.trim())
+        .filter(Boolean);
+
+    if (domains.length === 0) {
+        alert("Please enter at least one domain.");
+        return;
+    }
+
+    resultsBody.innerHTML = "";
+    statsDiv.textContent = "Checking connection...";
+    checkButton.disabled = true;
+
+    try {
+        await checkHealth(apiBase, token);
+    } catch (error) {
+        statsDiv.textContent = error.message;
+        statsDiv.className = "stats error";
+        checkButton.disabled = false;
+        return;
+    }
+
+    statsDiv.className = "stats";
+
+    let blockedCount = 0;
+    let notBlockedCount = 0;
+    let errorCount = 0;
+    let currentIndex = 0;
+
+    const rows = domains.map((domain) => {
+        const row = document.createElement("tr");
+        const inputCell = document.createElement("td");
+        const checkedDomainCell = document.createElement("td");
+        const statusCell = document.createElement("td");
+
+        inputCell.textContent = domain;
+        checkedDomainCell.textContent = normalizeDomainForDisplay(domain) || "Invalid input";
+        statusCell.textContent = "Queued...";
+
+        row.appendChild(inputCell);
+        row.appendChild(checkedDomainCell);
+        row.appendChild(statusCell);
+        resultsBody.appendChild(row);
+
+        return row;
+    });
+
+    setStats(domains.length, blockedCount, notBlockedCount, errorCount, false);
+
+    async function worker() {
+        while (currentIndex < domains.length) {
+            const index = currentIndex++;
+            const domain = domains[index];
+            const row = rows[index];
+            const statusCell = row.children[2];
+
+            statusCell.textContent = "Checking...";
+            statusCell.className = "";
+
+            try {
+                const result = await checkDomain(apiBase, token, domain);
+                const className = classifyResult(result);
+
+                statusCell.textContent = result;
+                statusCell.className = className;
+
+                if (className === "blocked") {
+                    blockedCount++;
+                } else if (className === "not-blocked") {
+                    notBlockedCount++;
+                } else {
+                    errorCount++;
+                }
+            } catch (error) {
+                statusCell.textContent = error.message;
+                statusCell.className = "error";
+                errorCount++;
+            }
+
+            setStats(domains.length, blockedCount, notBlockedCount, errorCount, false);
+        }
+    }
+
+    const workers = [];
+    for (let i = 0; i < Math.min(MAX_CONCURRENT, domains.length); i++) {
+        workers.push(worker());
+    }
+
+    await Promise.all(workers);
+    setStats(domains.length, blockedCount, notBlockedCount, errorCount, true);
+    checkButton.disabled = false;
+}
+</script>
+
+</body>
+</html>
